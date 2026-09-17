@@ -2,11 +2,13 @@
 //! stdio, protocol v1) and maps its session updates onto [`AgentEvent`]s.
 //!
 //! KEPT ONLY for agents built ground-up on ACP: Grok ([`AcpHarness::grok`],
-//! `grok agent stdio`), Devin ([`AcpHarness::devin`], `devin acp`) and Hermes
-//! ([`AcpHarness::hermes`], `hermes acp`) and Antigravity
+//! `grok agent stdio`), Devin ([`AcpHarness::devin`], `devin acp`), Hermes
+//! ([`AcpHarness::hermes`], `hermes acp`), Antigravity
 //! ([`AcpHarness::antigravity`], Google's `agy_acp_server`, installed from its
-//! pinned release archive) — plus pi ([`AcpHarness::pi`]) via the community
-//! `pi-acp` adapter until a native driver exists. Claude, Codex and Cursor moved to native drivers
+//! pinned release archive) and Omp ([`AcpHarness::omp`],
+//! `omp acp` — Oh My Pi's native server) — plus pi ([`AcpHarness::pi`])
+//! via the community `pi-acp` adapter until a native driver exists.
+//! Claude, Codex and Cursor moved to native drivers
 //! ([`crate::ClaudeHarness`], [`crate::CodexHarness`], [`crate::CursorHarness`])
 //! after adapter-mediated ACP kept manufacturing done-status bugs the native
 //! wires don't have (turn-hold bookkeeping vs the CLI's own eager result).
@@ -408,6 +410,18 @@ fn hermes_spec() -> AcpAgentSpec {
     }
 }
 
+fn omp_install_paths() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(home) = crate::executable::home_dir() {
+        dirs.push(home.join(".local").join("bin").join("omp"));
+        dirs.push(home.join(".omp").join("bin").join("omp"));
+        dirs.push(home.join(".npm-global").join("bin").join("omp"));
+    }
+    dirs.push(PathBuf::from("/opt/homebrew/bin/omp"));
+    dirs.push(PathBuf::from("/usr/local/bin/omp"));
+    dirs
+}
+
 fn pi_spec() -> AcpAgentSpec {
     AcpAgentSpec {
         id: HarnessId::Pi,
@@ -751,6 +765,96 @@ fn antigravity_spec() -> AcpAgentSpec {
     }
 }
 
+fn omp_spec() -> AcpAgentSpec {
+    AcpAgentSpec {
+        id: HarnessId::Omp,
+        display_name: "Omp",
+        executable: "omp",
+        env_override: "OMP_EXECUTABLE",
+        // Native ACP server (verified live, 18.2.5): `omp acp` == `omp --mode
+        // acp`. No managed npm adapter — the installer (omp.sh/install,
+        // brew can1357/tap/omp, bun -g @oh-my-pi/pi-coding-agent) owns the
+        // binary, so resolution is PATH + install dirs.
+        args: &["acp"],
+        npm_package: None,
+        archive: None,
+        extra_paths: omp_install_paths,
+        cli_executable: "omp",
+        cli_extra_paths: omp_install_paths,
+        install_hint: "omp (searched PATH, the login shell's PATH, ~/.local/bin, \
+             ~/.npm-global/bin, /opt/homebrew/bin, /usr/local/bin, and \
+             fnm/nvm/volta/pnpm/bun install dirs; install with \
+             `curl -fsSL https://omp.sh/install | sh` or \
+             `bun install -g @oh-my-pi/pi-coding-agent`; set OMP_EXECUTABLE to override)",
+        // Verified live (18.2.5): session/new advertises a `model` config
+        // option (the user's full provider catalog, current = their omp
+        // default) plus a `thinking` thought_level select whose options AND
+        // reset value depend on the current model (switching models can
+        // shrink the ladder and reset current, e.g. xhigh→high). Static
+        // fallback is the session default when the probe cannot run;
+        // discovery takes over with the live rows whenever the CLI answers.
+        models: || {
+            vec![Model {
+                id: "default".into(),
+                label: "omp default".into(),
+                description: Some("Runs the model configured in omp (`omp` settings)".into()),
+                reasoning_levels: vec![
+                    ReasoningLevel::Minimal,
+                    ReasoningLevel::Low,
+                    ReasoningLevel::Medium,
+                    ReasoningLevel::High,
+                    ReasoningLevel::XHigh,
+                    ReasoningLevel::Max,
+                ],
+                options: Vec::new(),
+            }]
+        },
+        // No `_session/steering` extension advertised: turn boundaries.
+        steering_mode: SteeringMode::TurnBoundary,
+        // omp's thinking ladder (off/auto have no zeron equivalent and are
+        // left to the agent default — "off" maps to no effort row).
+        reasoning_levels: &[
+            ReasoningLevel::Minimal,
+            ReasoningLevel::Low,
+            ReasoningLevel::Medium,
+            ReasoningLevel::High,
+            ReasoningLevel::XHigh,
+            ReasoningLevel::Max,
+        ],
+        prompt_transform: identity_transform,
+        effort_values: omp_effort_values,
+        ladder_extras: &[],
+        prompt_complete_extension: false,
+        prompt_stall: None,
+        stall_hint: "The agent process is likely wedged.",
+        effort_in_model_id: false,
+        auth_method: None,
+        skill_dirs: Vec::new,
+        hidden_commands: &[],
+    }
+}
+/// omp's `thinking` ladder values, in preference order for the run's
+/// reasoning: its `off` (no thinking) and `auto` (per-prompt detect) tiers
+/// have no zeron equivalent, so an explicit level maps to its own value
+/// first and degrades down the generic ladder; no level leaves the agent
+/// default in place.
+fn omp_effort_values(reasoning: Option<ReasoningLevel>, _model: Option<&str>) -> Vec<&'static str> {
+    let Some(level) = reasoning else {
+        return Vec::new();
+    };
+    match level {
+        ReasoningLevel::Minimal => vec!["minimal", "low"],
+        ReasoningLevel::Low => vec!["low", "minimal"],
+        ReasoningLevel::Medium => vec!["medium"],
+        ReasoningLevel::High => vec!["high"],
+        ReasoningLevel::XHigh => vec!["xhigh", "high"],
+        ReasoningLevel::Max => vec!["max", "xhigh", "high"],
+        ReasoningLevel::Ultra | ReasoningLevel::Ultracode | ReasoningLevel::Ultrathink => {
+            vec!["max", "high"]
+        }
+    }
+}
+
 /// how long a sign-in may wait on the browser: the antigravity server gives
 /// its loopback redirect 300s, plus room for the token exchange.
 const SIGN_IN_TIMEOUT: Duration = Duration::from_secs(330);
@@ -1034,6 +1138,11 @@ impl AcpHarness {
                 SIGN_IN_TIMEOUT.as_secs() / 60
             ))),
         }
+    }
+
+    /// Oh My Pi over ACP — its native `omp acp` server.
+    pub fn omp() -> Self {
+        Self::with_spec(omp_spec())
     }
 
     /// Use a fixed agent binary instead of PATH/known-location resolution.
@@ -4747,5 +4856,63 @@ mod tests {
         assert_eq!(commands.len(), 1);
         assert_eq!(commands[0].name, "compact");
         assert!(scan_available_commands(&json!({ "protocolVersion": 1 })).is_empty());
+    }
+
+    #[test]
+    fn omp_thinking_and_model_config_options_map_to_wire_ids() {
+        // Live shape from `omp acp` 18.2.4: `thinking` is the thought_level
+        // select (off/auto have no zeron tier), `model` carries the ids.
+        // The set payload uses the driver's `{configId, value}` shape.
+        let response = json!({
+            "sessionId": "s-1",
+            "configOptions": [
+                {
+                    "id": "thinking",
+                    "name": "Thinking",
+                    "category": "thought_level",
+                    "type": "select",
+                    "currentValue": "xhigh",
+                    "options": [
+                        { "value": "off", "name": "Off" },
+                        { "value": "auto", "name": "Auto" },
+                        { "value": "minimal", "name": "minimal" },
+                        { "value": "low", "name": "low" },
+                        { "value": "medium", "name": "medium" },
+                        { "value": "high", "name": "high" },
+                        { "value": "xhigh", "name": "xhigh" },
+                        { "value": "max", "name": "max" },
+                    ],
+                },
+                {
+                    "id": "model",
+                    "name": "Model",
+                    "category": "model",
+                    "type": "select",
+                    "currentValue": "model-a",
+                    "options": [
+                        { "value": "model-a", "name": "Model A" },
+                        { "value": "model-b", "name": "Model B" },
+                    ],
+                },
+            ],
+        });
+        let no_opts = serde_json::Map::new();
+        assert_eq!(
+            config_option_sets(
+                &response,
+                Some("model-b"),
+                &omp_effort_values(Some(ReasoningLevel::Low), None),
+                &no_opts,
+            ),
+            vec![
+                ("thinking".to_owned(), json!({ "value": "low" })),
+                ("model".to_owned(), json!({ "value": "model-b" })),
+            ]
+        );
+        // No reasoning leaves the agent's thinking default alone.
+        assert_eq!(
+            config_option_sets(&response, None, &omp_effort_values(None, None), &no_opts),
+            Vec::new(),
+        );
     }
 }

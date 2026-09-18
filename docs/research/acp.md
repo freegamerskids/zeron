@@ -80,7 +80,10 @@
   so the ladder is minimal→max and an empty reasoning leaves the agent
   default. `session/set_config_option` takes the driver's `{configId, value}`
   shape (verified: `{key, value}` is rejected as unknown). Turn-boundary
-  steering; auth rides the user's existing `~/.omp` credentials.
+  steering; auth rides the user's existing `~/.omp` credentials. Switching
+  models rewrites the `thinking` ladder AND its reset value (verified live
+  18.2.5: xhigh→high on a narrower model), so the run applies the model
+  switch first and resolves reasoning against the returned configuration.
 - **ACP is the source of truth for model lists** (2026-08-08; preference
   order inverted 2026-08-09): `models()` runs a short-lived probe
   (initialize → `session/new`, the `discover_commands` pattern) and reads

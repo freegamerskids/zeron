@@ -724,9 +724,9 @@ mod tests {
                 HarnessId::Grok,
                 HarnessId::Hermes,
                 HarnessId::Pi,
+                HarnessId::Omp,
                 HarnessId::Opencode,
-                HarnessId::Antigravity,
-                HarnessId::Omp
+                HarnessId::Antigravity
             ]
         );
         assert!(registry.resolve(HarnessId::Mock).is_ok());

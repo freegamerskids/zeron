@@ -660,6 +660,40 @@ fn hermes_and_pi_descriptor_surfaces_match_registry_expectations() {
     );
 }
 
+fn omp_refresh_harness() -> AcpHarness {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("fake-omp-refresh.sh");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755));
+    }
+    AcpHarness::omp().with_executable(path)
+}
+
+#[tokio::test]
+async fn omp_applies_model_switch_before_thinking_from_the_fresh_ladder() {
+    // The fixture's session/new advertises model-a with thinking only
+    // through high; switching to model-b rewrites the ladder to include
+    // xhigh/max (Omp 18.2.5 live behavior). Requesting model-b + xhigh must
+    // send BOTH sets: resolving xhigh against the stale initial ladder
+    // would skip the thinking set entirely (P2).
+    let mut req = request("scenario:refresh");
+    req.model = Some("model-b".into());
+    req.reasoning = Some(ReasoningLevel::XHigh);
+    let (controls, _steer, _token) = controls();
+    let events = run_to_end(&omp_refresh_harness(), req, controls).await;
+    assert!(
+        events.contains(&AgentEvent::TextDelta {
+            text: "refreshed".into()
+        }),
+        "{events:?}"
+    );
+    assert_eq!(dones(&events), vec![(DoneStatus::Completed, None)]);
+}
+
 fn antigravity_harness() -> AcpHarness {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")

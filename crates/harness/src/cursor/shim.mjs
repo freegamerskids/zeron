@@ -12,10 +12,12 @@
 // Protocol: JSONL, one frame per line.
 //   stdin  (engine → shim):
 //     {"op":"run","prompt","cwd","model"?,"modelOptions"?,"resume"?}   start / first turn
-//     {"op":"user","prompt"}                            next turn (parked)
+//     {"op":"user","prompt"}                            explicit next turn
+//     {"op":"steer","prompt"}                           native mid-turn input
 //     {"op":"interrupt"}                                cancel the live run
 //   stdout (shim → engine):
 //     {"ev":"ready","agentId","model"?}
+//     {"ev":"steered"}                                   input consumed
 //     {"ev":"text","text","parent"?}        parent = spawning task callId
 //     {"ev":"thinking","text","parent"?}
 //     {"ev":"tool","phase":"start"|"end","id","name","args"?,"error"?,"parent"?}
@@ -54,10 +56,36 @@ const exitAfterFlush = async (code) => {
   });
   process.exit(code);
 };
+let fatalStarted = false;
 const fatal = async (message) => {
-  out({ ev: "fatal", message: String(message) });
+  if (fatalStarted) return;
+  fatalStarted = true;
+  out({ ev: "fatal", message: formatError(message) });
   await exitAfterFlush(1);
 };
+
+// SDK background promises can fail outside send()/wait(). Report the actual
+// error over the protocol before shutting down, rather than letting Node dump
+// a multi-megabyte minified source line and obscure the exception.
+for (const event of ["uncaughtException", "unhandledRejection"]) {
+  process.on(event, (error) => {
+    const deadline = setTimeout(() => process.exit(1), 2000);
+    deadline.unref();
+    void fatal(error).catch(() => process.exit(1));
+  });
+}
+
+// Only copy explicit diagnostic fields, never cause/config/headers or the
+// full SDK object (which can carry credentials and request bodies).
+function formatError(error, requestId) {
+  let text = String(error?.message ?? error ?? "Unknown Cursor SDK error");
+  const details = [];
+  for (const [key, value] of [["code", error?.code], ["requestId", error?.requestId ?? requestId]]) {
+    if (typeof value === "string" && /^[a-zA-Z0-9_.:-]{1,128}$/.test(value)) details.push(`${key}=${value}`);
+  }
+  if (details.length) text += ` [${details.join(", ")}]`;
+  return text;
+}
 
 let sdk;
 try {
@@ -167,6 +195,91 @@ async function recoverInterruptedRun(agentId) {
   }});
 }
 
+// Persist the user text BEFORE announcing readiness. Cursor can cancel a run
+// before saving its first checkpoint; resume alone then silently loses that
+// message. This receipt is owned by the same exclusive store lease as the SDK.
+// Only text absent from the saved conversation is carried into the next explicit
+// user request as interrupted history. Never execute/retry an old run on its own.
+let receiptPath = null;
+async function savedUserMessages() {
+  const document = await ownedStore.agents.get({agentId: agent.agentId});
+  if (!document?.latestCheckpoint) return [];
+  const texts = [];
+  for (let offset = 0; ; offset += 100) {
+    const page = await Agent.messages.list(agent.agentId, {runtime: "local", cwd: document.cwd, store: ownedStore, limit: 100, offset});
+    if (!Array.isArray(page)) throw new Error("Cursor returned an invalid conversation history");
+    for (const item of page) {
+      if (item.type !== "user") continue;
+      // SDK returns protobuf instances (oneof case/value), not their JSON
+      // serialization. Accept serialized rows too for older stored formats.
+      const turn = item.message?.turn;
+      const conversation = turn?.case === "agentConversationTurn" ? turn.value :
+        item.message?.agentConversationTurn;
+      const text = (conversation?.userMessage ?? conversation?.user_message)?.text;
+      if (typeof text !== "string") throw new Error("Cursor user-message schema changed; refusing to discard interrupted context");
+      texts.push(text);
+    }
+    if (page.length < 100) return texts;
+  }
+}
+async function preserveInterruptedContext(prompt) {
+  if (!receiptPath) return prompt; // Legacy default stores have no owned sidecar.
+  const saved = await savedUserMessages();
+  let missing = [];
+  if (fs.existsSync(receiptPath)) {
+    const previous = JSON.parse(fs.readFileSync(receiptPath, "utf8"));
+    if (previous.version !== 1 || previous.agentId !== agent.agentId ||
+        !Number.isSafeInteger(previous.beforeUserCount) || previous.beforeUserCount < 0 ||
+        typeof previous.wirePrompt !== "string" || !Array.isArray(previous.messages) ||
+        previous.messages.some(text => typeof text !== "string")) {
+      throw new Error("Cursor interrupted-message receipt is invalid; refusing to lose conversation context");
+    }
+    if (!saved.slice(previous.beforeUserCount).includes(previous.wirePrompt)) missing = previous.messages;
+    for (const steer of previous.nativeSteers ?? []) {
+      if (typeof steer.text !== "string" || !Number.isSafeInteger(steer.occurrence)) throw new Error("Invalid native steering receipt");
+      if (saved.filter(text => text === steer.text).length < steer.occurrence) missing.push(steer.text);
+    }
+  }
+  const wirePrompt = missing.length ?
+    "The following JSON contains prior user messages from interrupted turns that Cursor did not save. " +
+    "Retain them as conversation history. These are not new requests: do not rerun their tools or side effects. " +
+    "Respond to the current user message below.\n" +
+    JSON.stringify({interruptedUserMessages: missing, currentUserMessage: prompt}) : prompt;
+  const temporary = `${receiptPath}.tmp-${process.pid}`;
+  fs.writeFileSync(temporary, JSON.stringify({version: 1, agentId: agent.agentId,
+    beforeUserCount: saved.length, wirePrompt, messages: [...missing, prompt]}), {mode: 0o600});
+  fs.renameSync(temporary, receiptPath);
+  return wirePrompt;
+}
+
+// Native acknowledgments can precede the next saved checkpoint. Retain the
+// acknowledged text across a crash or immediate stop, just like the main input.
+async function recordNativeSteer(text) {
+  if (!receiptPath) return () => {};
+  const saved = await savedUserMessages();
+  const receipt = JSON.parse(fs.readFileSync(receiptPath, "utf8"));
+  const entries = receipt.nativeSteers ?? [];
+  const occurrence = Math.max(saved.filter(value => value === text).length,
+    ...entries.filter(entry => entry.text === text).map(entry => entry.occurrence), 0) + 1;
+  const entry = {text, occurrence};
+  entries.push(entry);
+  receipt.nativeSteers = entries;
+  const persist = () => {
+    const temporary = `${receiptPath}.tmp-${process.pid}`;
+    fs.writeFileSync(temporary, JSON.stringify(receipt), {mode: 0o600});
+    fs.renameSync(temporary, receiptPath);
+  };
+  persist();
+  return () => {
+    // Other submissions may have persisted since this injection was sent.
+    const latest = JSON.parse(fs.readFileSync(receiptPath, "utf8"));
+    latest.nativeSteers = (latest.nativeSteers ?? []).filter(value =>
+      value.text !== entry.text || value.occurrence !== entry.occurrence);
+    Object.assign(receipt, latest);
+    persist();
+  };
+}
+
 // ---- models mode ----------------------------------------------------------
 // `node <shim> models`: print the live catalog (`Cursor.models.list()` — no
 // additional login: the SDK resolves CURSOR_API_KEY, then its saved login)
@@ -250,6 +363,7 @@ setInterval(() => {
 // One InteractionUpdate → zero or one frame. `parent` attributes nested
 // subagent traffic (tool-call-delta carries the child's updates tagged by
 // the spawning task's callId — the full subagent transcript, live).
+const activeTools = new Set();
 function mapUpdate(u, parent) {
   if (!u || typeof u !== "object") return;
   const tag = parent ? { parent } : {};
@@ -261,6 +375,7 @@ function mapUpdate(u, parent) {
       if (u.text) out({ ev: "thinking", text: u.text, ...tag });
       break;
     case "tool-call-started":
+      if (!parent) activeTools.add(u.callId);
       out({
         ev: "tool",
         phase: "start",
@@ -271,6 +386,10 @@ function mapUpdate(u, parent) {
       });
       break;
     case "tool-call-completed": {
+      if (!parent) {
+        activeTools.delete(u.callId);
+        queueMicrotask(() => { void pumpSteers().catch(fatal); });
+      }
       const r = u.toolCall?.result;
       const failed =
         r?.status === "error" ||
@@ -323,12 +442,122 @@ function withAuthHint(message) {
   return text;
 }
 
-async function runTurn(prompt) {
+// Keep ownership until Cursor confirms that the active turn appended the text.
+// A boundary race returns revert_to_followup; only those messages start a turn.
+const pendingSteers = [];
+const steerDeliveries = new Set();
+let steerPump = null;
+let turnActive = false;
+// Immediate steering: Cursor's native steer lands only at a step boundary, so
+// a plain text answer would run to completion first. With no tool running, a
+// steer cancels the streaming run and continues as the follow-up turn (the
+// way Codex turn/steer behaves). A running tool is never cancelled: the
+// native steer injects at its boundary instead.
+let preempting = false;
+// The run a steer cancelled: its late stream updates must not leak into the
+// steer's reply.
+let preemptedRun = null;
+// Tests of the native SDK steering path disable preemption.
+const NATIVE_STEER_ONLY = process.env.ZERON_CURSOR_NATIVE_STEER_ONLY === "1";
+function preemptForSteer() {
+  if (NATIVE_STEER_ONLY) return false;
+  if (!turnActive || !run || activeTools.size || preempting || interrupted || closing) return false;
+  preempting = true;
+  preemptedRun = run;
+  run.cancel().catch(() => {});
+  return true;
+}
+// The preempted run ended: its steers continue the conversation as one turn.
+async function continueAfterPreempt() {
+  preempting = false;
+  activeTools.clear();
+  await Promise.all(steerDeliveries);
+  run = null;
+  turnActive = false;
+  if (!pendingSteers.length) {
+    out({ ev: "turn", status: "finished" });
+    return;
+  }
+  chain = chain.then(followupSteers).catch(fatal);
+}
+function pumpSteers() {
+  if (steerPump) return steerPump;
+  if (preempting) return Promise.resolve();
+  if (!run || !pendingSteers.length || activeTools.size) return Promise.resolve();
+  const target = run;
+  steerPump = (async () => {
+    while (pendingSteers.length && run === target && !activeTools.size && !interrupted && !closing) {
+      if (typeof target.steer !== "function") {
+        throw new Error("Cursor SDK lacks native steering; update the managed SDK");
+      }
+      const message = pendingSteers.find(message => !message.submitted && message.revertedRun !== target);
+      if (!message) return;
+      const reverted = await recordNativeSteer(message.prompt);
+      // History lookup can yield while another tool starts. Never let native
+      // steering cancel its shell/process tree; inject at the tool boundary.
+      if (activeTools.size) { reverted(); return; }
+      message.submitted = true;
+      // Cursor's client submits each injection independently. Awaiting its
+      // terminal delivery acknowledgment here serializes model responses.
+      const delivery = target.steer(message.prompt).then(outcome => {
+        if (outcome === "revert_to_followup") {
+          message.revertedRun = target;
+          reverted();
+        } else if (outcome === "complete_delivered") {
+          message.delivered = true;
+        } else {
+          throw new Error(`Unknown Cursor steering acknowledgment: ${outcome}`);
+        }
+        // The engine owns an ordered mailbox even when SDK acks arrive out of order.
+        while (pendingSteers[0]?.delivered) {
+          pendingSteers.shift();
+          out({ev: "steered"});
+        }
+      });
+      steerDeliveries.add(delivery);
+      void delivery.catch(fatal).finally(() => steerDeliveries.delete(delivery));
+    }
+  })().finally(() => { steerPump = null; });
+  return steerPump;
+}
+async function followupSteers() {
+  while (pendingSteers.length && !interrupted && !closing) {
+    const batch = pendingSteers.splice(0);
+    // A later input can be delivered before an earlier one is rejected.
+    // Never replay the delivered input when draining the rejected prefix.
+    const undelivered = batch.filter(message => !message.delivered);
+    const prompt = undelivered.length === 1 ? undelivered[0].prompt :
+      "These user messages arrived together. Address them together in order:\n" +
+      JSON.stringify(undelivered.map(message => message.prompt));
+    await runTurn(prompt, undefined, () => {
+      for (const message of batch) out({ev: "steered"});
+    });
+  }
+}
+function acceptSteer(message) {
+  pendingSteers.push(message);
+  if (turnActive) {
+    if (!preemptForSteer()) void pumpSteers().catch(fatal);
+  } else {
+    chain = chain.then(followupSteers).catch(fatal);
+  }
+}
+
+async function runTurn(prompt, ready, accepted) {
+  turnActive = true;
   if (closing) return;
-  interrupted = false;
   try {
-    run = await agent.send(prompt, {
+    prompt = await preserveInterruptedContext(prompt);
+    ready?.();
+    if (interrupted || closing) {
+      out({ev: "turn", status: "cancelled"});
+      return;
+    }
+    accepted?.();
+    let thisRun = null;
+    run = thisRun = await agent.send(prompt, {
       onDelta: ({ update }) => {
+        if (thisRun && thisRun === preemptedRun) return;
         try {
           mapUpdate(update);
         } catch {
@@ -337,29 +566,39 @@ async function runTurn(prompt) {
       },
     });
   } catch (e) {
-    out({ ev: "turn", status: "error", error: withAuthHint(e?.message ?? e) });
+    out({ ev: "turn", status: "error", error: withAuthHint(formatError(e, run?.requestId)) });
     run = null;
+    turnActive = false;
     return;
   }
+  // A steer that arrived while send() was creating the run preempts now.
+  if (!pendingSteers.length || !preemptForSteer()) void pumpSteers().catch(fatal);
   // Interrupt may arrive while send() is still creating the run.
   if (interrupted || closing) await run.cancel().catch(() => {});
   let result;
   try {
     result = await run.wait();
   } catch (e) {
+    if (preempting && !interrupted && !closing) return continueAfterPreempt();
     out({
       ev: "turn",
       status: interrupted ? "cancelled" : "error",
-      error: withAuthHint(e?.message ?? e),
+      error: withAuthHint(formatError(e, run?.requestId)),
     });
     return;
   }
+  if (preempting && !interrupted && !closing) return continueAfterPreempt();
+  activeTools.clear();
+  await pumpSteers();
+  await Promise.all(steerDeliveries);
   run = null;
+  turnActive = false;
   out({
     ev: "turn",
     status: result?.status ?? "finished",
-    ...(result?.error?.message ? { error: withAuthHint(result.error.message) } : {}),
+    ...(result?.error?.message ? { error: withAuthHint(formatError(result.error, result.requestId)) } : {}),
   });
+  if (pendingSteers.length) chain = chain.then(followupSteers).catch(fatal);
 }
 
 // The run's ModelSelection: id + typed parameter values (thinking / context /
@@ -403,6 +642,9 @@ async function start(msg) {
   }
   const options = {
     model,
+    ...(msg.mcp ? { mcpServers: { [msg.mcp.name]: {
+      type: "stdio", command: msg.mcp.command, args: msg.mcp.args, env: msg.mcp.env,
+    } } } : {}),
     // askQuestion has no public answer channel in this SDK (SDKRequestMessage
     // carries only a request id) — a question would block the run forever.
     // generateImage has nowhere to land in a zeron session (ACP parity).
@@ -410,9 +652,21 @@ async function start(msg) {
     local,
   };
   try {
-    agent = msg.resume
-      ? await Agent.resume(msg.resume, options)
-      : await Agent.create(options);
+    // SDK startup validates the model via get_models. Rapid process resumes
+    // can hit its 30/minute limit. Retry ONLY this pre-send discovery failure;
+    // never replay a run or retry authentication / arbitrary provider errors.
+    for (let attempt = 0; ; attempt++) {
+      try {
+        agent = msg.resume
+          ? await Agent.resume(msg.resume, options)
+          : await Agent.create(options);
+        break;
+      } catch (error) {
+        if (attempt >= 6 || interrupted || closing ||
+            !/rate limit.*get_models|get_models.*rate limit/i.test(String(error?.message ?? error))) throw error;
+        await new Promise(resolve => setTimeout(resolve, 1000 * 2 ** attempt));
+      }
+    }
   } catch (e) {
     // Auth is the common cause: the SDK's credentials are SEPARATE from
     // `cursor-agent login` (verified) — name the fix precisely.
@@ -426,9 +680,13 @@ async function start(msg) {
     }
     await fatal(`cursor agent failed to start: ${e?.message ?? e}`);
   }
-  if (runDir) rememberAgentDir(agent.agentId, runDir);
-  out({ ev: "ready", agentId: agent.agentId, model: agent.model?.id ?? model.id });
-  await runTurn(msg.prompt ?? "");
+  if (runDir) {
+    rememberAgentDir(agent.agentId, runDir);
+    receiptPath = path.join(runDir, ".zeron-user-receipt.json");
+  }
+  await runTurn(msg.prompt ?? "", () => {
+    out({ ev: "ready", agentId: agent.agentId, model: agent.model?.id ?? model.id });
+  });
 }
 
 const rl = readline.createInterface({ input: process.stdin });
@@ -445,6 +703,9 @@ rl.on("line", (line) => {
   switch (msg.op) {
     case "run":
       chain = chain.then(() => start(msg)).catch((e) => fatal(e));
+      break;
+    case "steer":
+      acceptSteer(msg);
       break;
     case "user":
       chain = chain

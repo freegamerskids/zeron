@@ -46,7 +46,7 @@ impl ChangeRequestBadgeModel {
             ChangeRequestState::Closed => ("Closed", ChangeRequestBadgeTone::Closed),
         };
         Self {
-            number: format!("#{}", summary.number).into(),
+            number: summary.number.to_string().into(),
             state_label,
             title: summary.title.replace(['\r', '\n'], " ").into(),
             tone,
@@ -80,14 +80,14 @@ impl Render for ChangeRequestTooltip {
             .border_1()
             .border_color(theme.border_strong)
             .bg(crate::popover::surface_bg(theme))
-            .shadow_md()
+            .when(!theme.is_frost(), |el| el.shadow_md())
             .child(
                 div()
                     .text_size(px(11.0))
                     .font_weight(gpui::FontWeight::MEDIUM)
                     .text_color(self.model.tone.color(theme))
                     .child(SharedString::from(format!(
-                        "PR {} · {}",
+                        "PR #{} · {}",
                         self.model.number, self.model.state_label
                     ))),
             )
@@ -126,6 +126,27 @@ pub(crate) fn pull_request_badge_with_query(
     query: Option<&str>,
     theme: &Theme,
 ) -> AnyElement {
+    render_pull_request_badge(id, summary, surface, query, true, theme)
+}
+
+/// The same badge geometry without hover, tooltip, or click behavior in drag previews.
+pub(crate) fn pull_request_badge_preview(
+    id: SharedString,
+    summary: ChangeRequestSummary,
+    surface: ChangeRequestBadgeSurface,
+    theme: &Theme,
+) -> AnyElement {
+    render_pull_request_badge(id, summary, surface, None, false, theme)
+}
+
+fn render_pull_request_badge(
+    id: SharedString,
+    summary: ChangeRequestSummary,
+    surface: ChangeRequestBadgeSurface,
+    query: Option<&str>,
+    interactive: bool,
+    theme: &Theme,
+) -> AnyElement {
     let model = ChangeRequestBadgeModel::from_summary(&summary);
     let color = model.tone.color(theme);
     let url = summary.url.clone();
@@ -139,32 +160,32 @@ pub(crate) fn pull_request_badge_with_query(
         .flex()
         .flex_row()
         .items_center()
-        .gap(px(if composer { 5.0 } else { 0.0 }))
+        .gap(px(if composer { 5.0 } else { 3.0 }))
         .px(px(if composer { 7.0 } else { 4.0 }))
         .rounded(px(if composer { 6.0 } else { 4.0 }))
         .bg(color.opacity(0.08))
         .text_size(px(if composer { 11.0 } else { 10.0 }))
         .font_weight(gpui::FontWeight::MEDIUM)
         .text_color(color.opacity(0.85))
-        .cursor_pointer()
-        .hover(move |style| style.bg(color.opacity(0.16)).text_color(color))
-        .on_click(move |_, _, cx| {
-            cx.stop_propagation();
-            cx.open_url(&url);
+        .when(interactive, |el| {
+            el.cursor_pointer()
+                .hover(move |style| style.bg(color.opacity(0.16)).text_color(color))
+                .on_click(move |_, _, cx| {
+                    cx.stop_propagation();
+                    cx.open_url(&url);
+                })
+                .tooltip(move |_, cx| {
+                    cx.new(|_| ChangeRequestTooltip::new(&tooltip_summary))
+                        .into()
+                })
+                .tooltip_show_delay(std::time::Duration::from_millis(350))
         })
-        .tooltip(move |_, cx| {
-            cx.new(|_| ChangeRequestTooltip::new(&tooltip_summary))
-                .into()
-        })
-        .tooltip_show_delay(std::time::Duration::from_millis(350))
-        .when(composer, |element| {
-            element.child(
-                crate::icons::icon(crate::icons::PULL_REQUEST)
-                    .size(px(11.0))
-                    .flex_none()
-                    .text_color(color.opacity(0.85)),
-            )
-        })
+        .child(
+            crate::icons::icon(crate::icons::PULL_REQUEST)
+                .size(px(if composer { 11.0 } else { 10.0 }))
+                .flex_none()
+                .text_color(color.opacity(0.85)),
+        )
         // Monospace digits give the badge a stable tabular width as PR numbers change.
         .child(
             div()
@@ -356,6 +377,7 @@ mod tests {
             created_at: Utc.timestamp_opt(0, 0).unwrap(),
             harness_session_id: None,
             harness_session_cwd: None,
+            parent_chat_id: None,
             space_id: Some("space".into()),
             last_seen_at: None,
             room_gen: None,
@@ -624,7 +646,7 @@ mod tests {
             summary.state = state;
             summary.title = "First line\nSecond line".into();
             let model = ChangeRequestBadgeModel::from_summary(&summary);
-            assert_eq!(model.number, "#90");
+            assert_eq!(model.number, "90");
             assert_eq!(model.state_label, label);
             assert_eq!(model.tone, tone);
             assert_eq!(model.title, "First line Second line");

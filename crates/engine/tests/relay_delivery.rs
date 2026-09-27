@@ -224,6 +224,7 @@ async fn rows_dark_command_delivers_over_the_peer_relay_exactly_once() {
         last_seen_at: Some(chrono::Utc::now()),
         created_at: None,
         version: Some("0.2.12".into()),
+        cursor_sdk_version: None,
         capabilities: zeron_proto::capabilities::current(),
     });
     let client_a = zeron_rpc::memory_client(core_a.rpc_service());
@@ -243,6 +244,7 @@ async fn rows_dark_command_delivers_over_the_peer_relay_exactly_once() {
     // grace elapses; the entry crosses the peer link instead.
     let command = serde_json::to_value(SessionCommandPayload::Run {
         request: RunRequest {
+            mcp: None,
             prompt: "over the relay".into(),
             harness: None,
             model: None,
